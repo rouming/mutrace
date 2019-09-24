@@ -44,6 +44,42 @@
 #error "This stuff only works on Linux!"
 #endif
 
+#include <sys/types.h>
+
+/*
+ *  CRC generator shortcut table.
+ */
+static const u_int crctab[] = {
+    0x00000000, 0x1db71064, 0x3b6e20c8, 0x26d930ac,
+    0x76dc4190, 0x6b6b51f4, 0x4db26158, 0x5005713c,
+    0xedb88320, 0xf00f9344, 0xd6d6a3e8, 0xcb61b38c,
+    0x9b64c2b0, 0x86d3d2d4, 0xa00ae278, 0xbdbdf21c
+};
+
+/*
+ *  Generate CRC32 for data block 'data' with size 'length'.
+ *
+ *  Returns generated CRC32.
+ */
+static inline uint32_t crc32(void *data, size_t length)
+{
+        const u_char *p = data;
+        const u_int *crctabp = crctab;
+        uint32_t crc = 0xffffffff;
+        int i;
+
+        if (length < 1)
+                return -1;
+
+        i = length;
+        while (i-- > 0) {
+                crc ^= *p++;
+                crc = (crc >> 4) ^ crctabp[crc & 0xf];
+                crc = (crc >> 4) ^ crctabp[crc & 0xf];
+        }
+        return crc;
+}
+
 #ifndef SCHED_RESET_ON_FORK
 /* "Your libc lacks the definition of SCHED_RESET_ON_FORK. We'll now
  * define it ourselves, however make sure your kernel is new
@@ -60,9 +96,17 @@
 #define LIKELY(x) (__builtin_expect(!!(x),1))
 #define UNLIKELY(x) (__builtin_expect(!!(x),0))
 
+struct thread_info {
+        pid_t tid;
+        char comm[32];
+};
+
 struct stacktrace_info {
         void **frames;
         int nb_frame;
+        uint32_t crc32;
+        struct thread_info *threads;
+        unsigned threads_n;
 };
 
 /* Used to differentiate between statistics for read-only and read-write locks
@@ -72,6 +116,9 @@ typedef enum {
         READ = 1,
 } LockType;
 #define NUM_LOCK_TYPES READ + 1
+
+#define STACKTRACES_NUM 16
+#define THREADS_NUM     32
 
 struct mutex_info {
         pthread_mutex_t *mutex;
@@ -99,6 +146,8 @@ struct mutex_info {
 
         uint64_t nsec_timestamp[NUM_LOCK_TYPES];
         struct stacktrace_info stacktrace;
+        struct stacktrace_info call_stacktraces[STACKTRACES_NUM];
+        unsigned call_stacktraces_n;
 
         unsigned id;
 
@@ -781,6 +830,7 @@ static bool cond_info_show(struct cond_info *ci) {
 
 static bool mutex_info_dump(struct mutex_info *mi) {
         char *stacktrace_str;
+        unsigned i, j;
 
         if (!mutex_info_show(mi))
                 return false;
@@ -790,8 +840,24 @@ static bool mutex_info_dump(struct mutex_info *mi) {
         fprintf(stderr,
                 "\nMutex #%u (0x%p) first referenced by:\n"
                 "%s", mi->id, mi->mutex ? (void*) mi->mutex : (void*) mi->rwlock, stacktrace_str);
-
         free(stacktrace_str);
+        fprintf(stderr, "Called from these stacks:\n");
+        for (i = 0; i < mi->call_stacktraces_n; i++) {
+                struct stacktrace_info *trace = &mi->call_stacktraces[i];
+
+                fprintf(stderr, "\t#%d called by threads: ", i+1);
+                for (j = 0; j < trace->threads_n; j++) {
+                        struct thread_info *thread = &trace->threads[j];
+
+                        fprintf(stderr, "%s [%d]; ", thread->comm, thread->tid);
+                }
+                fprintf(stderr, "\n");
+                stacktrace_str = stacktrace_to_string(mi->call_stacktraces[i]);
+                fprintf(stderr, "%s", stacktrace_str);
+                free(stacktrace_str);
+        }
+        fprintf(stderr, "\n\n");
+
 
         return true;
 }
@@ -1282,14 +1348,55 @@ static int light_backtrace(void **buffer, int size) {
 #endif
 }
 
-static struct stacktrace_info generate_stacktrace(void) {
+static struct stacktrace_info alloc_stacktrace(void) {
         struct stacktrace_info stacktrace;
 
         stacktrace.frames = malloc(sizeof(void*) * frames_max);
         assert(stacktrace.frames);
 
-        stacktrace.nb_frame = light_backtrace(stacktrace.frames, frames_max);
-        assert(stacktrace.nb_frame >= 0);
+        stacktrace.threads = malloc(sizeof(*stacktrace.threads) * THREADS_NUM);
+        assert(stacktrace.threads);
+
+        stacktrace.nb_frame = 0;
+        stacktrace.threads_n = 0;
+
+        return stacktrace;
+}
+
+static void fill_stacktrace(struct stacktrace_info *stacktrace) {
+        stacktrace->nb_frame = light_backtrace(stacktrace->frames, frames_max);
+        assert(stacktrace->nb_frame >= 0);
+
+        stacktrace->crc32 = crc32(stacktrace->frames,
+                                 sizeof(void *) * stacktrace->nb_frame);
+
+        if (stacktrace->threads_n < THREADS_NUM) {
+                bool accept_thread = true;
+                pid_t tid = _gettid();
+                unsigned i;
+
+                for (i = 0; i < stacktrace->threads_n; i++) {
+                        if (stacktrace->threads[i].tid == tid) {
+                                accept_thread = false;
+                                break;
+                        }
+                }
+                if (accept_thread) {
+                        struct thread_info *thread =
+                                &stacktrace->threads[stacktrace->threads_n++];
+
+                        thread->tid = tid;
+                        pthread_getname_np(pthread_self(), thread->comm,
+                                           sizeof(thread->comm));
+                }
+        }
+}
+
+static struct stacktrace_info generate_stacktrace(void) {
+        struct stacktrace_info stacktrace;
+
+        stacktrace = alloc_stacktrace();
+        fill_stacktrace(&stacktrace);
 
         return stacktrace;
 }
@@ -1340,6 +1447,7 @@ static char *stacktrace_to_string(struct stacktrace_info stacktrace) {
 
 static struct mutex_info *mutex_info_add(unsigned long u, pthread_mutex_t *mutex, int type, int protocol) {
         struct mutex_info *mi;
+        unsigned i;
 
         /* Needs external locking */
 
@@ -1353,6 +1461,9 @@ static struct mutex_info *mutex_info_add(unsigned long u, pthread_mutex_t *mutex
         mi->type = type;
         mi->protocol = protocol;
         mi->stacktrace = generate_stacktrace();
+
+        for (i = 0; i < STACKTRACES_NUM; i++)
+                mi->call_stacktraces[i] = alloc_stacktrace();
 
         mi->next = alive_mutexes[u];
         alive_mutexes[u] = mi;
@@ -1497,8 +1608,30 @@ static void mutex_lock(pthread_mutex_t *mutex, bool busy, uint64_t nsec_contende
         mi->n_locked[WRITE]++;
 
         if (busy) {
+                struct stacktrace_info *trace;
+                unsigned i;
+
                 mi->n_contended[WRITE]++;
                 mi->nsec_contended_total[WRITE] += nsec_contended;
+
+                if (mi->call_stacktraces_n < STACKTRACES_NUM) {
+                        bool accept_trace = true;
+
+                        trace = &mi->call_stacktraces[mi->call_stacktraces_n];
+                        fill_stacktrace(trace);
+
+                        for (i = 0; i < mi->call_stacktraces_n; i++) {
+                                struct stacktrace_info *tmp_trace =
+                                        &mi->call_stacktraces[i];
+
+                                if (tmp_trace->crc32 == trace->crc32) {
+                                        accept_trace = false;
+                                        break;
+                                }
+                        }
+                        if (accept_trace)
+                                mi->call_stacktraces_n++;
+                }
         }
 
         tid = _gettid();
