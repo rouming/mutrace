@@ -506,7 +506,11 @@ static void setup(void) {
                  * lock routines that do not end up calling
                  * pthread_mutex_xxx(). */
 
-                real_exit(1);
+                /*
+                 * Not nice, but unfortunately no other options to trace ceph-osd
+                 *   -- rpen 23.09.19
+                 */
+                /* real_exit(1); */
         }
 
         t = hash_size;
@@ -1319,7 +1323,11 @@ static bool verify_frame(const char *s) {
 }
 
 static int light_backtrace(void **buffer, int size) {
-#if defined(__i386__) || defined(__x86_64__)
+/*
+ * Switch to backtrace() glibc call, stack is much better.
+ *    -- rpen
+ */
+#if 0 /* defined(__i386__) || defined(__x86_64__) */
         int osize = 0;
         void *stackaddr;
         size_t stacksize;
