@@ -45,12 +45,15 @@
 #define false 0
 
 #define _GNU_SOURCE
+
+#include "config.h"
+
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <execinfo.h>
 #include <bfd.h>
-#include <libiberty.h>
+#include <libiberty/libiberty.h>
 #include <dlfcn.h>
 #include <link.h>
 #if 0
